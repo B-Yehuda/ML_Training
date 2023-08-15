@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from threading import Thread
 import cv2
-from queue import Queue
+from queue import Queue, Empty
 import time
 from datetime import datetime
 from src.ml_projects_utils.writing_output_utils import write_output, copy_from_aws_to_redshift_table
@@ -20,14 +20,8 @@ from src.settings.twitch_credentials_settings import TwitchCredentials
 
 
 @dataclass
-class VideoUrlToStreamLinkParallelConf:
-    channel_data: dict
-    video_quality: str
-
-
-@dataclass
 class VideoFaceDetectionConf:
-    s_c_d: dict
+    channel_data: dict
     skip_frames_by_seconds: int or bool
     skip_frames_by_rate: int or bool
     video_max_process_time_hrs: int
@@ -35,6 +29,7 @@ class VideoFaceDetectionConf:
 
 class FileVideoStream:
     def __init__(self,
+                 link_url,
                  video_url,
                  video_max_process_time_hrs,
                  skip_frames_by_seconds,
@@ -66,7 +61,7 @@ class FileVideoStream:
         self.transform = False
 
         # Initialize the queue used to store frames read from the video file
-        self.Q = Queue(maxsize=queue_size)
+        self.q = Queue(maxsize=queue_size)
 
         # Initialize thread
         self.thread = Thread(target=self.read_frames_from_video, args=())
@@ -88,7 +83,7 @@ class FileVideoStream:
                 break
 
             # Otherwise, ensure the queue has room in it
-            if not self.Q.full():
+            if not self.q.full():
                 # Grab the next frame from the file
                 grabbed = self.video_cap.grab()
 
@@ -108,7 +103,7 @@ class FileVideoStream:
                         # Convert frame to grayscale for face detection
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         # add the frame to the queue
-                        self.Q.put(frame)
+                        self.q.put(frame)
 
                 # Set frames counter
                 frame_index = frame_index + 1
@@ -116,7 +111,7 @@ class FileVideoStream:
                 # Stop when reach the limit of max frames to process
                 if frame_index > self.max_frames_to_process:
                     print(
-                        f"Max duration of {self.video_max_process_time_hrs} hrs process reached. Stopping fetching frames.")
+                        f"-- Max duration of {self.video_max_process_time_hrs} hrs process of video {self.link_url} has reached. Stopping fetching frames.")
                     self.fetched_all_frames = True
                     break
 
@@ -125,20 +120,21 @@ class FileVideoStream:
                 time.sleep(0.1)
 
         self.video_cap.release()
+        self.stopped = True
 
     def read_next_frame_from_queue(self):
-        # return next frame in the queue
-        return self.Q.get()
+        # Return next frame in the queue, break after 3 sec if queue is empty
+        return self.q.get(timeout=3)
 
     def more(self):
         # If consumer faster than producer - hold
         tries = 0
-        while self.Q.qsize() == 0 and not self.fetched_all_frames and tries < 100:
+        while self.q.qsize() == 0 and not self.fetched_all_frames and tries < 100:
             time.sleep(0.1)
             tries += 1
 
         # Continue if there are still frames in the queue else stop since producer has reached end of file stream
-        is_continue = False if (self.stopped or (self.Q.qsize() == 0 and self.fetched_all_frames)) else True
+        is_continue = False if (self.stopped or (self.q.qsize() == 0 and self.fetched_all_frames)) else True
         return is_continue
 
     def stop(self):
@@ -177,7 +173,7 @@ def frame_face_detection(face_classifier, frame) -> bool:
 
 def video_face_detection(conf: VideoFaceDetectionConf) -> dict:
     print(
-        f"- Processing video {conf.s_c_d['twitch_url']} of channel {conf.s_c_d['channel_id']} - started at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
+        f"- Processing video {conf.channel_data['twitch_url']} of channel {conf.channel_data['channel_id']} - started at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
 
     # TODO: Is it possible to use ProcessPoolExecutor() for the face detection part?
 
@@ -185,16 +181,22 @@ def video_face_detection(conf: VideoFaceDetectionConf) -> dict:
     face_classifier = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
     # Initialize thread process
-    fvs = FileVideoStream(video_url=conf.s_c_d['streamlink_url'],
+    fvs = FileVideoStream(link_url=conf.channel_data['twitch_url'],
+                          video_url=conf.channel_data['streamlink_url'],
                           video_max_process_time_hrs=conf.video_max_process_time_hrs,
                           skip_frames_by_seconds=conf.skip_frames_by_seconds,
                           skip_frames_by_rate=conf.skip_frames_by_rate).start()
 
-    detected = False
+    face_detected = False
 
     while fvs.more():
         # Read next frame
-        frame = fvs.read_next_frame_from_queue()
+        try:
+            frame = fvs.read_next_frame_from_queue()
+        except Empty as e:
+            print(
+                f"-- The frames queue of video {conf.channel_data['twitch_url']} was empty, after 3 sec of holding, continue trying...")
+            continue
 
         display_frames_during_process = False
         if display_frames_during_process:
@@ -205,20 +207,20 @@ def video_face_detection(conf: VideoFaceDetectionConf) -> dict:
                 break
 
         # Run face detection process
-        detected = frame_face_detection(face_classifier=face_classifier, frame=frame)
-        if detected:
+        face_detected = frame_face_detection(face_classifier=face_classifier, frame=frame)
+        if face_detected:
             fvs.stop()
             print(
-                f"- Processing video {conf.s_c_d['twitch_url']} (face detection = \033[1mTRUE\033[0m) of channel {conf.s_c_d['channel_id']} - finished at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
-            conf.s_c_d['face_detected'] = True
-            return conf.s_c_d
+                f"- Processing video {conf.channel_data['twitch_url']} (face detection = \033[1mTRUE\033[0m) of channel {conf.channel_data['channel_id']} - finished at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
+            conf.channel_data['face_detected'] = True
+            return conf.channel_data
 
-    if not detected:
+    if not face_detected:
         fvs.stop()
         print(
-            f"- Processing video {conf.s_c_d['twitch_url']} (face detection = \033[1mFALSE\033[0m) of channel {conf.s_c_d['channel_id']} - finished at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
-        conf.s_c_d['face_detected'] = False
-        return conf.s_c_d
+            f"- Processing video {conf.channel_data['twitch_url']} (face detection = \033[1mFALSE\033[0m) of channel {conf.channel_data['channel_id']} - finished at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
+        conf.channel_data['face_detected'] = False
+        return conf.channel_data
 
 
 def twitch_fake_channels_detection_pipeline(config_objects: dict,
@@ -285,7 +287,7 @@ def twitch_fake_channels_detection_pipeline(config_objects: dict,
         print(
             f"\nScraping URLs from Twitch API in parallel - started at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
 
-        suspicious_channels_data = [s_c_d for s_c_d in
+        suspicious_channels_data = [channel_data for channel_data in
                                     executor.map(scrape_videos_urls_for_twitch_channel,
                                                  [ScrapeVideosOfChannelConf(
                                                      channel_id=channel_id,
@@ -318,12 +320,12 @@ def twitch_fake_channels_detection_pipeline(config_objects: dict,
         print(
             f"\nConverting Twitch URLs to StreamLink URLs in parallel - started at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m")
 
-        suspicious_channels_data = [updated_s_c_d for updated_s_c_d in
+        suspicious_channels_data = [updated_channel_data for updated_channel_data in
                                     executor.map(video_url_to_stream_link,
                                                  [VideoUrlToStreamLinkConf(
-                                                     s_c_d=s_c_d,
+                                                     channel_data=channel_data,
                                                      video_quality=twitch_fake_channels_detection_config.video_quality)
-                                                     for s_c_d in suspicious_channels_data]
+                                                     for channel_data in suspicious_channels_data]
                                                  )]
         suspicious_channels_data = [d for d in suspicious_channels_data if d]
 
@@ -343,21 +345,14 @@ def twitch_fake_channels_detection_pipeline(config_objects: dict,
         print(
             f"\nFace detection parallel process - started at: \033[1m{datetime.now().isoformat(' ', 'seconds')}\033[0m\n")
 
-
-        suspicious_channels_data = [{"channel_id": "82550365",
-                                     "twitch_url": "blabla",
-                                     "streamlink_url": "https://xxdgeft87wbj63p.cloudfront.net/60ced98521314deafc28_imandruill_40975463800_1691612669/480p30/index-muted-J4V9YIV319.m3u8"
-                                     }]
-
-
-        suspicious_channels_data = [updated_s_c_d for updated_s_c_d in
+        suspicious_channels_data = [updated_channel_data for updated_channel_data in
                                     executor.map(video_face_detection,
                                                  [VideoFaceDetectionConf(
-                                                     s_c_d=s_c_d,
+                                                     channel_data=channel_data,
                                                      skip_frames_by_seconds=twitch_fake_channels_detection_config.skip_frames_by_seconds,
                                                      skip_frames_by_rate=twitch_fake_channels_detection_config.skip_frames_by_rate,
                                                      video_max_process_time_hrs=twitch_fake_channels_detection_config.video_max_process_time_hrs)
-                                                     for s_c_d in suspicious_channels_data]
+                                                     for channel_data in suspicious_channels_data]
                                                  )]
 
         print(
@@ -418,7 +413,7 @@ def twitch_fake_channels_detection_pipeline(config_objects: dict,
                                      buckets=[twitch_fake_channels_detection_config.predictions_to_aws_bucket],
                                      config=config)
 
-        # Write df_results into Redshift table
+        # Write df_face_detection into Redshift table
         copy_from_aws_to_redshift_table(conn=conn,
                                         cur=cur,
                                         schema=schema_interim,
